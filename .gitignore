@@ -1,16 +1,9 @@
 # 秘密情報
 .env
 .env.*
-.env.local
-.env.production
+!.env.example
 
-# ビルド・ランタイム
-node_modules/
-dist/
-__pycache__/
-*.pyc
-
-# データ（SQLite DB、ログ）
+# ローカル状態
 data/
 logs/
 *.db
@@ -18,12 +11,19 @@ logs/
 *.db-wal
 *.log
 
-# OS
+# ビルド
+node_modules/
+dist/
+__pycache__/
+*.pyc
+
+# OS / IDE
 .DS_Store
 Thumbs.db
-
-# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# Claude Code (ローカル設定)
+.claude/
