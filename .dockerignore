@@ -1,0 +1,9 @@
+node_modules
+data
+logs
+.env
+.env.*
+.git
+*.db
+*.log
+.DS_Store

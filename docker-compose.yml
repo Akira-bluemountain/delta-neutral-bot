@@ -1,0 +1,51 @@
+services:
+  ext-signer:
+    build: ./signer
+    container_name: ext-signer
+    restart: always
+    env_file: .env
+    expose:
+      - "3001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  dn-engine:
+    build: .
+    container_name: dn-engine
+    restart: always
+    env_file: .env
+    environment:
+      - EXT_SIGNER_URL=http://ext-signer:3001
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - ext-signer
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dn-engine
+
+volumes:
+  caddy_data:
+  caddy_config:

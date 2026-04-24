@@ -1,0 +1,233 @@
+import { VENUES, SCREENING, DN_PARAMS } from "../core/config";
+import { hlToExtSymbol } from "../core/symbol-mapping";
+import {
+  FundingRate,
+  OrderBook,
+  ScreeningResult,
+  VenueId,
+} from "../core/types";
+import { getRecentFundingRates } from "../db/database";
+import { fetchFundingRates, fetchOrderBook } from "../collectors/hyperliquid";
+import {
+  fetchFundingRates as fetchExtFundingRates,
+  fetchOrderBook as fetchExtOrderBook,
+} from "../collectors/extended";
+
+// 既存Botのスコア計算式を完全再現
+export function calculateScore(
+  frNext: number,
+  frPrev: number,
+  cost: number,
+  n: number = SCREENING.costRecoveryDays
+): number {
+  return (
+    ((frNext + frPrev) * 3 * 365 * 100) / 2 +
+    ((frNext - cost) * 365 * 100) / n
+  );
+}
+
+// 板からスプレッド+スリッページを算出
+export function calculateCost(
+  orderBook: OrderBook,
+  sizeUsd: number,
+  venue: VenueId
+): { spread: number; slippage: number; totalCost: number } {
+  const config = VENUES[venue];
+
+  if (orderBook.asks.length === 0 || orderBook.bids.length === 0) {
+    return { spread: 0, slippage: 0, totalCost: config.makerFeeRate * 2 + config.takerFeeRate * 2 };
+  }
+
+  const bestAsk = orderBook.asks[0].price;
+  const bestBid = orderBook.bids[0].price;
+  const midPrice = (bestAsk + bestBid) / 2;
+  const spread = (bestAsk - bestBid) / midPrice;
+
+  // スリッページ推定: sizeUsd分の板厚を消費した場合の価格インパクト
+  let slippage = 0;
+  let remainingUsd = sizeUsd;
+  let totalCostWeighted = 0;
+
+  for (const ask of orderBook.asks) {
+    const levelUsd = ask.price * ask.size;
+    const consumed = Math.min(remainingUsd, levelUsd);
+    totalCostWeighted += consumed * (ask.price - bestAsk) / bestAsk;
+    remainingUsd -= consumed;
+    if (remainingUsd <= 0) break;
+  }
+  if (sizeUsd > 0) {
+    slippage = totalCostWeighted / sizeUsd;
+  }
+
+  // 合計コスト: spread + slippage + maker手数料×2 + taker手数料×2
+  const totalCost =
+    spread + slippage + config.makerFeeRate * 2 + config.takerFeeRate * 2;
+
+  return { spread, slippage, totalCost };
+}
+
+// 過去FRの平均を取得
+function getAveragePrevFr(
+  venue: string,
+  symbol: string,
+  count: number
+): number {
+  const rates = getRecentFundingRates(venue, symbol, count);
+  if (rates.length === 0) return 0;
+  return rates.reduce((sum, r) => sum + r.rate, 0) / rates.length;
+}
+
+// メインスクリーニングフロー
+export async function runScreening(): Promise<ScreeningResult[]> {
+  console.log("[スクリーニング] 開始...");
+
+  // 1. 両ベニューのFR取得
+  const [hlRates, extRates] = await Promise.all([
+    fetchFundingRates(),
+    fetchExtFundingRates(),
+  ]);
+
+  // Extendedの銘柄マップ
+  const extRateMap = new Map<string, FundingRate>();
+  for (const r of extRates) {
+    extRateMap.set(r.symbol, r);
+  }
+
+  // 2. FR閾値でフィルタ
+  const candidates = hlRates
+    .filter((r) => Math.abs(r.rate) >= SCREENING.minFundingRate)
+    .sort((a, b) => Math.abs(b.rate) - Math.abs(a.rate))
+    .slice(0, SCREENING.maxCandidates);
+
+  // ホワイトリスト内で FR 閾値を通過した銘柄数を可視化（Task B1）
+  const whitelistSet = new Set(DN_PARAMS.symbolWhitelist);
+  const whitelistedPassCount = candidates.filter((c) =>
+    whitelistSet.has(c.symbol)
+  ).length;
+  const whitelistSize = DN_PARAMS.symbolWhitelist.length;
+
+  console.log(
+    `[スクリーニング] FR閾値通過: ${candidates.length}銘柄 / ${hlRates.length}銘柄` +
+      ` (ホワイトリスト ${whitelistSize}銘柄中 ${whitelistedPassCount}銘柄が閾値通過)`
+  );
+
+  // 3. 各銘柄のスコア計算
+  const results: ScreeningResult[] = [];
+
+  for (const hlRate of candidates) {
+    const symbol = hlRate.symbol;  // HL 命名（kPEPE の可能性）
+    // Task B4: HL の k 接頭銘柄 → EXT の 1000 接頭に変換して EXT 側を照会
+    //   kPEPE  → 1000PEPE  (EXT 命名で lookup / 板取得)
+    //   BTC    → BTC       (非倍率銘柄は変換なし、同一命名)
+    const extSymbol = hlToExtSymbol(symbol);
+    const extRate = extRateMap.get(extSymbol) || null;
+
+    // Extended に存在しない銘柄はスキップ（DN戦略には両ベニュー必須）
+    if (!extRate) {
+      continue;
+    }
+
+    // 板情報取得
+    let hlBook: OrderBook;
+    let extBook: OrderBook;
+    try {
+      [hlBook, extBook] = await Promise.all([
+        fetchOrderBook(symbol),       // HL 命名
+        fetchExtOrderBook(extSymbol), // EXT 命名（倍率は "1000PEPE"、非倍率は HL と同名）
+      ]);
+    } catch (err) {
+      console.warn(`[スクリーニング] ${symbol} 板情報取得失敗: ${err}`);
+      continue;
+    }
+
+    // コスト計算
+    const hlCostData = calculateCost(hlBook, SCREENING.depthCheckUsd, "hyperliquid");
+    const extCostData = calculateCost(extBook, SCREENING.depthCheckUsd, "extended");
+
+    // 過去FR平均
+    const hlPrevFr = getAveragePrevFr("hyperliquid", symbol, SCREENING.numPrevFr);
+
+    // 既存Botスコア（HL基準）
+    const classicScore = calculateScore(
+      hlRate.rate,
+      hlPrevFr,
+      hlCostData.totalCost
+    );
+
+    // Extended利用時のボーナス（maker0%によるコスト削減分）
+    const costSaving = hlCostData.totalCost - extCostData.totalCost;
+    const extendedBonus = costSaving > 0
+      ? (costSaving * 365 * 100) / SCREENING.costRecoveryDays
+      : 0;
+
+    const compositeScore = classicScore + extendedBonus;
+
+    // 推奨ベニュー: コストが低い方でshort
+    const recommendedShortVenue: VenueId =
+      extRate && extCostData.totalCost < hlCostData.totalCost
+        ? "extended"
+        : "hyperliquid";
+
+    // 推定APY: FR年率 - コスト年率
+    const bestCost = Math.min(hlCostData.totalCost, extCostData.totalCost);
+    const estimatedApy = hlRate.annualized - bestCost * 365 * 100;
+
+    results.push({
+      symbol,
+      classicScore,
+      extendedBonus,
+      compositeScore,
+      hlFundingRate: hlRate,
+      extFundingRate: extRate,
+      hlSpread: hlCostData.spread,
+      extSpread: extCostData.spread,
+      hlCost: hlCostData.totalCost,
+      extCost: extCostData.totalCost,
+      recommendedShortVenue,
+      estimatedApy,
+    });
+  }
+
+  // スコア順にソート
+  results.sort((a, b) => b.compositeScore - a.compositeScore);
+
+  // コンソール出力（既存Bot形式を踏襲）
+  printScreeningTable(results.slice(0, 20));
+
+  return results;
+}
+
+// 既存Botのコンソール出力フォーマットを踏襲
+function printScreeningTable(results: ScreeningResult[]): void {
+  console.log(
+    "Symbol".padEnd(12) +
+      "Score[APY]".padEnd(12) +
+      "FRnext %".padEnd(10) +
+      "FRprev %".padEnd(10) +
+      "Cost_HL %".padEnd(11) +
+      "Cost_EXT %".padEnd(12) +
+      "Recommend"
+  );
+  console.log("-".repeat(77));
+
+  for (const r of results) {
+    const frNext = (r.hlFundingRate.rate * 100).toFixed(4);
+    const frPrev = r.extFundingRate
+      ? (r.extFundingRate.rate * 100).toFixed(4)
+      : "N/A";
+    const costHl = (r.hlCost * 100).toFixed(4);
+    const costExt = (r.extCost * 100).toFixed(4);
+    const venue =
+      r.recommendedShortVenue === "extended" ? "Extended" : "HL";
+
+    console.log(
+      r.symbol.padEnd(12) +
+        r.compositeScore.toFixed(0).padEnd(12) +
+        frNext.padEnd(10) +
+        frPrev.padEnd(10) +
+        costHl.padEnd(11) +
+        costExt.padEnd(12) +
+        venue
+    );
+  }
+}
