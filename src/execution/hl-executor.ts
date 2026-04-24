@@ -254,13 +254,26 @@ export async function placeOrder(params: PlaceOrderParams): Promise<OrderResult>
     };
   }
 
+  // URGENT-FIX (2026-04-25): 二段目防御。呼び出し側が roundPrice を忘れても
+  // floatToWire 境界違反を起こさないよう placeOrder 自身で最終丸めを行う。
+  // 既に丸め済みでも同値なので副作用なし。
+  const price = roundPrice(params.price, info.szDecimals);
+  if (price <= 0) {
+    return {
+      success: false,
+      outcome: "rejected",
+      cloid,
+      error: `丸め後の価格が 0 以下: raw=${params.price}`,
+    };
+  }
+
   const tif = params.orderType?.tif ?? "Gtc";
   const orderType: OrderTypeWire = { limit: { tif } };
 
   const wire = buildOrderWire({
     assetIndex: info.index,
     isBuy: params.isBuy,
-    price: params.price,
+    price,
     size,
     reduceOnly: params.reduceOnly ?? false,
     orderType,
@@ -562,19 +575,27 @@ export async function openPostOnly(params: {
   cloid?: string;
 }): Promise<OrderResult> {
   await getAssetCache();
+  const info = getAssetInfo(params.symbol);
   const cloid = params.cloid ?? generateCloid();
 
   // --- 指値価格の算出 ---
+  // URGENT-FIX (2026-04-25): midPrice × (1 ± offsetBps/10000) は IEEE 754 の性質で
+  // 8 桁超の小数を生むため、placeOrder に渡す前に roundPrice で HL 仕様
+  // (5 有効桁 & 6 - szDecimals 小数桁) に丸める必要がある。
+  // 未丸めだと buildOrderWire → floatToWire が throw し AMBIGUOUS 化する
+  // （CHIP#888/#890 インシデント根本原因）。
   const midPrice = await getMidPrice(params.symbol);
   const l2 = await getBestBidAsk(params.symbol);
   const offsetRatio = EXECUTION_PARAMS.postOnlyOffsetBps / 10000;
   let plannedLimitPrice: number;
   if (params.isBuy) {
     const midOffset = midPrice * (1 - offsetRatio);
-    plannedLimitPrice = l2 ? Math.min(midOffset, l2.bestBid) : midOffset;
+    const rawPrice = l2 ? Math.min(midOffset, l2.bestBid) : midOffset;
+    plannedLimitPrice = roundPrice(rawPrice, info.szDecimals);
   } else {
     const midOffset = midPrice * (1 + offsetRatio);
-    plannedLimitPrice = l2 ? Math.max(midOffset, l2.bestAsk) : midOffset;
+    const rawPrice = l2 ? Math.max(midOffset, l2.bestAsk) : midOffset;
+    plannedLimitPrice = roundPrice(rawPrice, info.szDecimals);
   }
 
   if (process.env.LOG_LEVEL === "debug") {
@@ -801,6 +822,9 @@ export async function bulkOrders(
     const info = getAssetInfo(order.symbol);
     const size = roundSize(order.size, info.szDecimals);
     if (size <= 0) continue;
+    // URGENT-FIX (2026-04-25): price にも roundPrice を適用（floatToWire 境界違反防止）
+    const price = roundPrice(order.price, info.szDecimals);
+    if (price <= 0) continue;
     const cloid = order.cloid ?? generateCloid();
     cloids.push(cloid);
 
@@ -809,7 +833,7 @@ export async function bulkOrders(
       buildOrderWire({
         assetIndex: info.index,
         isBuy: order.isBuy,
-        price: order.price,
+        price,
         size,
         reduceOnly: order.reduceOnly ?? false,
         orderType: { limit: { tif } },
