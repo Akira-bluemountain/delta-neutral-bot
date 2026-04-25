@@ -13,6 +13,44 @@ import {
   fetchOrderBook as fetchExtOrderBook,
 } from "../collectors/extended";
 
+/**
+ * Task C2: max(|HL|, |EXT|) ベースで FR 閾値判定・ソート・切り詰めを行う純粋関数。
+ *
+ * 旧実装 (HL 単独): `hlRates.filter(r => |r.rate| >= min).sort(|r.rate| desc).slice(0, max)`
+ *
+ * 旧実装では EIGEN のように「HL ほぼ 0 / EXT 高 FR」の銘柄が screening で除外され、
+ * strategy 層の FR 閾値判定 (Task C1) に到達しなかった。
+ * デルタニュートラル戦略は両取引所の FR 差で稼ぐため、片側高 FR も捕捉対象とすべき。
+ *
+ * 新実装: 両取引所のうち高い方の |FR| で判定・ソート。EXT データ欠損銘柄は HL 単独
+ * フォールバック（既存の「EXT に存在しない銘柄はスキップ」はループ内で従来通り機能する）。
+ *
+ * SCREENING.minFundingRate のコメント「両ベニュー対象を広く取る」と実装が一致する形。
+ *
+ * @param hlRates HL 銘柄の funding rate 一覧（HL 命名）
+ * @param extRateMap EXT 命名 → FundingRate のマップ（kPEPE は 1000PEPE で登録される）
+ * @param minFundingRate 最低閾値（絶対値、両ベニュー最大）
+ * @param maxCandidates 返却上限（max ベース降順の上位 N）
+ * @returns HL 命名の FundingRate 配列（元の HL rate を保持、下流処理はそのまま使用可）
+ */
+export function selectCandidatesByMaxFr(
+  hlRates: FundingRate[],
+  extRateMap: Map<string, FundingRate>,
+  minFundingRate: number,
+  maxCandidates: number
+): FundingRate[] {
+  return hlRates
+    .map((r) => {
+      const extRate = extRateMap.get(hlToExtSymbol(r.symbol));
+      const maxAbs = Math.max(Math.abs(r.rate), Math.abs(extRate?.rate ?? 0));
+      return { hlRate: r, maxAbs };
+    })
+    .filter((x) => x.maxAbs >= minFundingRate)
+    .sort((a, b) => b.maxAbs - a.maxAbs)
+    .slice(0, maxCandidates)
+    .map((x) => x.hlRate);
+}
+
 // 既存Botのスコア計算式を完全再現
 export function calculateScore(
   frNext: number,
@@ -93,11 +131,14 @@ export async function runScreening(): Promise<ScreeningResult[]> {
     extRateMap.set(r.symbol, r);
   }
 
-  // 2. FR閾値でフィルタ
-  const candidates = hlRates
-    .filter((r) => Math.abs(r.rate) >= SCREENING.minFundingRate)
-    .sort((a, b) => Math.abs(b.rate) - Math.abs(a.rate))
-    .slice(0, SCREENING.maxCandidates);
+  // 2. FR閾値でフィルタ — Task C2: max(|HL|, |EXT|) 判定に変更
+  //    （旧: HL 単独判定で EIGEN 等の片側高 FR 銘柄を逃していた）
+  const candidates = selectCandidatesByMaxFr(
+    hlRates,
+    extRateMap,
+    SCREENING.minFundingRate,
+    SCREENING.maxCandidates
+  );
 
   // ホワイトリスト内で FR 閾値を通過した銘柄数を可視化（Task B1）
   const whitelistSet = new Set(DN_PARAMS.symbolWhitelist);
@@ -106,9 +147,11 @@ export async function runScreening(): Promise<ScreeningResult[]> {
   ).length;
   const whitelistSize = DN_PARAMS.symbolWhitelist.length;
 
+  // Task C2: ログに判定基準を明示（max(|HL|, |EXT|) ≥ X%）
+  const minFrPct = (SCREENING.minFundingRate * 100).toFixed(4);
   console.log(
     `[スクリーニング] FR閾値通過: ${candidates.length}銘柄 / ${hlRates.length}銘柄` +
-      ` (ホワイトリスト ${whitelistSize}銘柄中 ${whitelistedPassCount}銘柄が閾値通過)`
+      ` (max(|HL|,|EXT|) ≥ ${minFrPct}% | ホワイトリスト ${whitelistSize}銘柄中 ${whitelistedPassCount}銘柄)`
   );
 
   // 3. 各銘柄のスコア計算
