@@ -53,9 +53,15 @@ export const SCREENING = {
 // DN戦略パラメータ（テスト運用: $1,000規模）
 export const DN_PARAMS = {
   pthOpen: [0.004, 0.0017] as [number, number], // [非証拠金, 証拠金]
-  frOpen: 0.00025, // Task A2: [0.00005, 0.00003] → 0.00025 scalar (損益分岐×1.17、年率219%グロス) docs/BOT_SPEC.md §15
+  frOpen: 0.00015, // Task C1 (2026-04-25): 0.00025 → 0.00015 (年率 219% → 131%)
+                   // Phase A/B 完了後 11h 0 エントリーを受け市場環境に合わせて調整。
+                   // EIGEN 144% 等の HIGH 機会を捕捉、MELANIA 64%/AVNT 58% は引き続き見送り。
+                   // 手数料回収: $50 × 131%/365 = $0.18/日 vs 往復 $0.0225 → 3h 以内回収。
+                   // 履歴: Task A2 0.00025 (年率 219%) ← [0.00005, 0.00003] (年率 44%/26%)
   pthClose: -0.0004,
-  frClose: 0.00010, // Task A2: 0.00002 → 0.00010 (frOpen の 40%ライン)
+  frClose: 0.00006, // Task C1 (2026-04-25): 0.00010 → 0.00006 (frOpen の 40% ライン維持、年率 53%)
+                    // 損益分岐 18% APY の約 2.6 倍上で経済合理性キープ。
+                    // 履歴: Task A2 0.00010 (年率 88%) ← 0.00002 (年率 18%)
   maxPositionUsd: 50, // IP フルサイクル成功確認済み → $50 に引き上げ
   minOrderUsd: 10, // 小額ポジション対応
   freeUsdtThreshold: 100, // テスト: 各ベニューに$100確保
@@ -222,8 +228,23 @@ export const RISK_PARAMS = {
   monitorIntervalMs: 30_000,
 };
 
-// APIキー設定（ユーザーが .env で設定する必須項目）
+// APIキー設定
 export const API_KEYS = {
+  get coinglassApiKey(): string {
+    return requireEnv("COINGLASS_API_KEY");
+  },
+  get nansenApiKey(): string {
+    return requireEnv("NANSEN_API_KEY");
+  },
+  get lineChannelToken(): string {
+    return requireEnv("LINE_CHANNEL_TOKEN");
+  },
+  get lineUserId(): string {
+    return requireEnv("LINE_USER_ID");
+  },
+  get anthropicApiKey(): string {
+    return requireEnv("ANTHROPIC_API_KEY");
+  },
   get hlWalletAddress(): string {
     return requireEnv("HL_API_WALLET_ADDRESS");
   },
@@ -250,6 +271,8 @@ export const DB_PATH = optionalEnv("DB_PATH", "./data/dn-engine.db");
 // ポーリング間隔（ミリ秒）
 export const INTERVALS = {
   fundingRate: 5 * 60 * 1000, // 5分
+  smartMoney: 5 * 60 * 1000, // 5分
+  defiLlama: 30 * 60 * 1000, // 30分
   screening: 1000, // 1秒
   apiMinDelay: 100, // API最低間隔 100ms
 };
